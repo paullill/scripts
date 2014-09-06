@@ -145,9 +145,9 @@ iptables -D OUTPUT -o $IP_INTERFACE -j DROP
 
 run_forward () {
 
-  if [ -z "$2" ];then
-   return 0
-  fi
+  #if [ -z "$2" ];then
+  # return 0
+  #fi
 
   echo "Forwarding..."
   DEVICE=`/sbin/ifconfig | grep -o "tun[0-9]"`
@@ -207,7 +207,8 @@ start_vpn () {
         --exec $DAEMON -- $OPTARGS --writepid $PIDFILE \
         $DAEMONARG $STATUSARG --cd $CONFIG_DIR \
         --config $CONFIG_DIR/$NAME.ovpn \
-    --auth-user-pass $CREDFILE || STATUS=1
+    --auth-user-pass $CREDFILE || STATUS=1 \
+	--mute-replay-warnings
 
     [ "$OMIT_SENDSIGS" -ne 1 ] || ln -s $PIDFILE /run/sendsigs.omit.d/openvpn.$NAME.pid
 
