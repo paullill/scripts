@@ -1,0 +1,460 @@
+#!/bin/sh -e
+
+### BEGIN INIT INFO
+# Provides:          openvpn
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Should-Start:      network-manager
+# Should-Stop:       network-manager
+# X-Start-Before:    $x-display-manager gdm kdm xdm wdm ldm sdm nodm
+# X-Interactive:     true
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Openvpn VPN service
+# Description: This script will start OpenVPN tunnels as specified
+#              in /etc/default/openvpn and /etc/openvpn/*.ovpn
+### END INIT INFO
+
+# Original version by Robert Leslie
+# <rob@mars.org>, edited by iwj and cs
+# Modified for openvpn by Alberto Gonzalez Iniesta <agi@inittab.org>
+# Modified for restarting / starting / stopping single tunnels by Richard Mueller <mueller@teamix.net>
+
+. /lib/lsb/init-functions
+test $DEBIAN_SCRIPT_DEBUG && set -v -x
+
+
+# =====IMPORTANT===== #
+# Locations of:
+# * Credentials
+CREDFILE="/etc/openvpn/PIA.cred"
+NAME=Sweden
+AUTOSTART=Sweden
+DESC="OpenVPN"
+
+#Where to store the forwarded port.
+PORTFILE="/tmp/pia_forwarded_port.txt"
+
+# ===IMPORTANT END==== #
+
+# File Locations
+DAEMON=/usr/sbin/openvpn
+PIDFILE=/var/run/openvpn.$NAME.pid
+PID_STATUS=/var/run/openvpn.$NAME.status
+
+# VPN Configuration Scraping
+
+CONFIG_DIR=/etc/openvpn/config
+VPN_PORT=$(cat $CONFIG_DIR/$NAME.ovpn | grep "remote " | awk '{print $3}' )
+VPN_PROTOCOL=$(cat $CONFIG_DIR/$NAME.ovpn | grep "proto" | awk '{print $2}' )
+
+# Subnet and eth device identification
+IP_INTERFACE=$(ip route ls | grep default | awk '{print $5}')
+IP_SUBNET=$(ip route ls | grep default | awk '{print $3}')
+
+#echo "L'$IP_INTERFACE'L"
+#echo $IP_SUBNET
+
+
+
+# Ensure that required directories + files exists
+test -x $DAEMON || exit 0 
+test -d $CONFIG_DIR || exit 0
+test -e $CREDFILE || exit 0 
+
+
+# Fetch Credential Data
+USERNAME=$(awk 'NR==1' $CREDFILE)
+PASSWORD=$(awk 'NR==2' $CREDFILE)
+ID=$(awk 'NR==3' $CREDFILE)
+
+
+# Source defaults file; edit that file to configure this script.
+STATUSREFRESH=10
+OMIT_SENDSIGS=0
+if test -e /etc/default/openvpn ; then
+  . /etc/default/openvpn
+fi
+
+
+start_iptables () {
+echo "Running IPTables Restrictions"
+
+# Setting default filter policy
+iptables -P INPUT ACCEPT #DROP
+iptables -P OUTPUT ACCEPT #DROP
+iptables -P FORWARD ACCEPT #DROP
+
+# Allow unlimited traffic on loopback
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+#############################################
+# Ingoing Traffic (Local)
+iptables -A INPUT -i $IP_INTERFACE -s $IP_SUBNET/24 -j ACCEPT # Allow everything on 192.168. subnet
+
+# Outgoing Traffic (Local)
+iptables -A OUTPUT -o $IP_INTERFACE -s $IP_SUBNET/24 -j ACCEPT # Allow everything on 192.168. subnet
+
+#############################################
+# Ingoing Traffic (Remote)
+iptables -A INPUT -i $IP_INTERFACE -p tcp --dport 22 -j ACCEPT # Allow port 22 In
+iptables -A INPUT -i $IP_INTERFACE -p $VPN_PROTOCOL --sport $VPN_PORT -j ACCEPT # Allow OpenVPN in
+
+# Outgoing Traffic (Remote)
+iptables -A OUTPUT -o $IP_INTERFACE -p tcp --dport 22 -j ACCEPT # Allow port 22 out
+iptables -A OUTPUT -o $IP_INTERFACE -p $VPN_PROTOCOL --sport $VPN_PORT -j ACCEPT  # Allow OpenVPN out
+
+
+# make sure nothing comes or goes out of this box
+iptables -A INPUT -i $IP_INTERFACE -j DROP
+iptables -A OUTPUT -o $IP_INTERFACE -j DROP
+
+#iptables -I INPUT 5 -m limit --limit 5/min -j LOG --log-prefix "iptables denied: " --log-level 7
+
+}
+
+stop_iptables () {
+echo "Resetting IPTABLES"
+
+# Allow unlimited traffic on loopback
+iptables -D INPUT -i lo -j ACCEPT
+iptables -D OUTPUT -o lo -j ACCEPT
+
+#############################################
+# Ingoing Traffic (Local)
+iptables -D INPUT -i $IP_INTERFACE -s $IP_SUBNET/24 -j ACCEPT # Allow everything on 192.168. subnet
+
+# Outgoing Traffic (Local)
+iptables -D OUTPUT -o $IP_INTERFACE -s $IP_SUBNET/24 -j ACCEPT # Allow everything on 192.168. subnet
+
+#############################################
+# Ingoing Traffic (Remote)
+iptables -D INPUT -i $IP_INTERFACE -p tcp --dport 22 -j ACCEPT # Allow port 22 In
+iptables -D INPUT -i $IP_INTERFACE -p $VPN_PROTOCOL --sport $VPN_PORT -j ACCEPT # Allow OpenVPN in
+
+# Outgoing Traffic (Remote)
+iptables -D OUTPUT -o $IP_INTERFACE -p tcp --dport 22 -j ACCEPT # Allow port 22 out
+iptables -D OUTPUT -o $IP_INTERFACE -p $VPN_PROTOCOL --sport $VPN_PORT -j ACCEPT  # Allow OpenVPN out
+
+
+# make sure nothing comes or goes out of this box
+iptables -D INPUT -i $IP_INTERFACE -j DROP
+iptables -D OUTPUT -o $IP_INTERFACE -j DROP
+}
+
+run_forward () {
+
+  if [ -z "$2" ];then
+   return 0
+  fi
+
+  echo "Forwarding..."
+  DEVICE=`/sbin/ifconfig | grep -o "tun[0-9]"`
+  LOCAL_IP=`/sbin/ifconfig $DEVICE | grep -Po "(?<=addr.)[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*"`
+  PORTNR=$(curl -d "user=$USERNAME&pass=$PASSWORD&client_id=$ID&local_ip=$LOCAL_IP" https://www.privateinternetaccess.com/vpninfo/port_forward_assignment 2> /dev/null | grep -Po "[0-9]*")
+  echo $PORTNR > $PORTFILE
+  echo "Forwarded port: $PORTNR"
+}
+
+
+start_vpn () {
+
+    if grep -q '^[   ]*daemon' $CONFIG_DIR/$NAME.ovpn ; then
+      # daemon already given in config file
+      DAEMONARG=
+    else
+      # need to daemonize
+      DAEMONARG="--daemon ovpn-$NAME"
+    fi
+
+    if grep -q '^[   ]*status ' $CONFIG_DIR/$NAME.ovpn ; then
+      # status file already given in config file
+      STATUSARG=""
+    elif test $STATUSREFRESH -eq 0 ; then
+      # default status file disabled in /etc/default/openvpn
+      STATUSARG=""
+    else
+      # prepare default status file
+      STATUSARG="--status $PID_STATUS $STATUSREFRESH"
+    fi
+
+    # tun using the "subnet" topology confuses the routing code that wrongly
+    # emits ICMP redirects for client to client communications
+    SAVED_DEFAULT_SEND_REDIRECTS=0
+    if grep -q '^[[:space:]]*dev[[:space:]]*tun' $CONFIG_DIR/$NAME.ovpn && \
+       grep -q '^[[:space:]]*topology[[:space:]]*subnet' $CONFIG_DIR/$NAME.ovpn ; then
+        # When using "client-to-client", OpenVPN routes the traffic itself without
+        # involving the TUN/TAP interface so no ICMP redirects are sent
+        if ! grep -q '^[[:space:]]*client-to-client' $CONFIG_DIR/$NAME.ovpn ; then
+            sysctl -w net.ipv4.conf.all.send_redirects=0 > /dev/null
+
+            # Save the default value for send_redirects before disabling it
+            # to make sure the tun device is created with send_redirects disabled
+            SAVED_DEFAULT_SEND_REDIRECTS=$(sysctl -n net.ipv4.conf.default.send_redirects)
+
+            if [ "$SAVED_DEFAULT_SEND_REDIRECTS" -ne 0 ]; then
+              sysctl -w net.ipv4.conf.default.send_redirects=0 > /dev/null
+            fi
+        fi
+    fi
+
+    log_progress_msg "$NAME"
+    STATUS=0 
+
+    start-stop-daemon --start --quiet --oknodo \
+        --pidfile $PIDFILE \
+        --exec $DAEMON -- $OPTARGS --writepid $PIDFILE \
+        $DAEMONARG $STATUSARG --cd $CONFIG_DIR \
+        --config $CONFIG_DIR/$NAME.ovpn \
+    --auth-user-pass $CREDFILE || STATUS=1
+
+    [ "$OMIT_SENDSIGS" -ne 1 ] || ln -s $PIDFILE /run/sendsigs.omit.d/openvpn.$NAME.pid
+
+    # Set the back the original default value of send_redirects if it was changed
+    if [ "$SAVED_DEFAULT_SEND_REDIRECTS" -ne 0 ]; then
+      sysctl -w net.ipv4.conf.default.send_redirects=$SAVED_DEFAULT_SEND_REDIRECTS > /dev/null
+    fi
+    echo "\nWaiting for connection to be fully established"
+
+    while [ -z $(ifconfig | grep tun | awk '{print $1 }') ];do
+        sleep 0.5
+    done
+
+}
+
+stop_vpn () {
+  stop_iptables
+  kill `cat $PIDFILE` || echo "OpenVPN is already shut down..."
+  rm -f $PIDFILE 2> /dev/null
+  [ "$OMIT_SENDSIGS" -ne 1 ] || rm -f /run/sendsigs.omit.d/openvpn.$NAME.pid
+  rm -f $PID_STATUS 2> /dev/null
+
+}
+
+case "$1" in
+start)
+  log_daemon_msg "Starting $DESC"
+
+  # Check if OpenVPN already runs
+  
+  PROCESS=$(ps -p $(cat $PIDFILE 2> /dev/null || echo 9000) -o comm= || echo "none" )
+ 
+  # Check if Process is already running
+  if [ $PROCESS = "openvpn" ]; then
+      echo "$DESC is already running!"
+      exit 0
+  fi
+
+
+  # Check if parameter #2 is set (openvpn start XXx)
+  if test -z "$2" ; then 
+
+    # check if automatic startup is disabled by AUTOSTART=none
+    if test "x$AUTOSTART" = "xnone" -o -z "$AUTOSTART" ; then
+      log_warning_msg " Autostart disabled."
+      exit 0
+    fi
+
+    # If AUTOSTART=all start all *.ovpn files
+    if test -z "$AUTOSTART" -o "x$AUTOSTART" = "xall" ; then
+      
+      # Iterate through all .ovpn files
+      for CONFIG in `cd $CONFIG_DIR; ls *.ovpn 2> /dev/null`; do
+        NAME=${CONFIG%%.ovpn}
+        start_vpn
+      done
+    
+    else
+      # If Autostart is NOT "none" and NOT "all" (May  be a list)
+      # start only specified VPNs
+
+      # Iterate though the list
+      for NAME in $AUTOSTART ; do
+
+         # Check if File exists 
+         if test -e $CONFIG_DIR/$NAME.ovpn ; then
+          start_vpn
+        else
+          log_failure_msg "No such VPN: $NAME"
+          STATUS=1
+        fi
+      done
+    fi
+
+  #start VPNs from command line
+  else
+
+    while shift ; do
+      [ -z "$1" ] && break
+
+      if test -e $CONFIG_DIR/$1.ovpn ; then
+        NAME=$1
+        start_vpn
+
+      else
+       log_failure_msg " No such VPN: $1"
+       STATUS=1
+      fi
+
+    done
+  fi
+  log_end_msg ${STATUS:-0}
+
+
+  # STARTING IPTABLES (Activating the ENGINE xDD)
+  start_iptables
+
+  run_forward # Do forwarding
+
+
+  ;;
+stop)
+  log_daemon_msg "Stopping $DESC"
+
+  if test -z "$2" ; then
+    for PIDFILE in `ls /var/run/openvpn.*.pid 2> /dev/null`; do
+      NAME=`echo $PIDFILE | cut -c18-`
+      NAME=${NAME%%.pid}
+      stop_vpn
+      log_progress_msg "$NAME"
+    done
+  else
+    while shift ; do
+      [ -z "$1" ] && break
+      if test -e /var/run/openvpn.$1.pid ; then
+        PIDFILE=`ls /var/run/openvpn.$1.pid 2> /dev/null`
+        NAME=`echo $PIDFILE | cut -c18-`
+        NAME=${NAME%%.pid}
+        stop_vpn
+        log_progress_msg "$NAME"
+      else
+        log_failure_msg " (failure: No such VPN is running: $1)"
+      fi
+    done
+  fi
+  log_end_msg 0
+  ;;
+# Only 'reload' running VPNs. New ones will only start with 'start' or 'restart'.
+reload|force-reload)
+ log_daemon_msg "Reloading $DESC"
+  for PIDFILE in `ls /var/run/openvpn.*.pid 2> /dev/null`; do
+    NAME=`echo $PIDFILE | cut -c18-`
+    NAME=${NAME%%.pid}
+# If openvpn if running under a different user than root we'll need to restart
+    if egrep '^[[:blank:]]*user[[:blank:]]' $CONFIG_DIR/$NAME.ovpn > /dev/null 2>&1 ; then
+      stop_vpn
+      sleep 1
+      start_vpn
+      log_progress_msg "(restarted)"
+    else
+      kill -HUP `cat $PIDFILE` || true
+    log_progress_msg "$NAME"
+    fi
+  done
+  log_end_msg 0
+  ;;
+
+# Only 'soft-restart' running VPNs. New ones will only start with 'start' or 'restart'.
+soft-restart)
+ log_daemon_msg "$DESC sending SIGUSR1"
+  for PIDFILE in `ls /var/run/openvpn.*.pid 2> /dev/null`; do
+    NAME=`echo $PIDFILE | cut -c18-`
+    NAME=${NAME%%.pid}
+    kill -USR1 `cat $PIDFILE` || true
+    log_progress_msg "$NAME"
+  done
+  log_end_msg 0
+ ;;
+
+restart)
+  shift
+  $0 stop ${@}
+  sleep 1
+  $0 start ${@}
+  ;;
+cond-restart)
+  log_daemon_msg "Restarting $DESC."
+  for PIDFILE in `ls /var/run/openvpn.*.pid 2> /dev/null`; do
+    NAME=`echo $PIDFILE | cut -c18-`
+    NAME=${NAME%%.pid}
+    stop_vpn
+    sleep 1
+    start_vpn
+  done
+  log_end_msg 0
+  ;;
+status)
+  GLOBAL_STATUS=0
+  if test -z "$2" ; then
+    # We want status for all defined VPNs.
+    # Returns success if all autostarted VPNs are defined and running
+    if test "x$AUTOSTART" = "xnone" ; then
+      # Consider it a failure if AUTOSTART=none
+      log_warning_msg "No VPN autostarted"
+      GLOBAL_STATUS=1
+    else
+      if ! test -z "$AUTOSTART" -o "x$AUTOSTART" = "xall" ; then
+        # Consider it a failure if one of the autostarted VPN is not defined
+        for VPN in $AUTOSTART ; do
+          if ! test -f $CONFIG_DIR/$VPN.ovpn ; then
+            log_warning_msg "VPN '$VPN' is in AUTOSTART but is not defined"
+            GLOBAL_STATUS=1
+          fi
+        done
+      fi
+    fi
+    for CONFIG in `cd $CONFIG_DIR; ls *.ovpn 2> /dev/null`; do
+      NAME=${CONFIG%%.ovpn}
+      # Is it an autostarted VPN ?
+      if test -z "$AUTOSTART" -o "x$AUTOSTART" = "xall" ; then
+        AUTOVPN=1
+      else
+        if test "x$AUTOSTART" = "xnone" ; then
+          AUTOVPN=0
+        else
+          AUTOVPN=0
+          for VPN in $AUTOSTART; do
+            if test "x$VPN" = "x$NAME" ; then
+              AUTOVPN=1
+            fi
+          done
+        fi
+      fi
+      if test "x$AUTOVPN" = "x1" ; then
+        # If it is autostarted, then it contributes to global status
+        status_of_proc -p /var/run/openvpn.${NAME}.pid openvpn "VPN '${NAME}'" || GLOBAL_STATUS=1
+      else
+        status_of_proc -p /var/run/openvpn.${NAME}.pid openvpn "VPN '${NAME}' (non autostarted)" || true
+      fi
+    done
+  else
+    # We just want status for specified VPNs.
+    # Returns success if all specified VPNs are defined and running
+    while shift ; do
+      [ -z "$1" ] && break
+      NAME=$1
+      if test -e $CONFIG_DIR/$NAME.ovpn ; then
+        # Config exists
+        status_of_proc -p /var/run/openvpn.${NAME}.pid openvpn "VPN '${NAME}'" || GLOBAL_STATUS=1
+      else
+        # Config does not exist
+        log_warning_msg "VPN '$NAME': missing $CONFIG_DIR/$NAME.ovpn file !"
+        GLOBAL_STATUS=1
+      fi
+    done
+  fi
+  exit $GLOBAL_STATUS
+  ;;
+forward)
+    run_forward
+;;
+*)
+  echo "Usage: $0 {start|stop|reload|restart|force-reload|cond-restart|soft-restart|status|forward} [forward]" >&2
+  exit 1
+  ;;
+esac
+
+exit 0
+
+# vim:set ai sts=2 sw=2 tw=0:
