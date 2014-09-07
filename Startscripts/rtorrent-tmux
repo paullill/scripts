@@ -1,0 +1,99 @@
+#!/bin/bash
+
+### BEGIN INIT INFO
+# Provides:          rtorrent
+# Required-Start:    $local_fs $network $remote_fs
+# Required-Stop:     $local_fs $network $remote_fs
+# Should-Start:      $NetworkManager
+# Should-Stop:       $NetworkManager
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: starts instance of rtorrent
+# Description:       starts instance of rtorrent using tmux
+### END INIT INFO
+
+#Setup
+USER=services
+SESS_NAME=rtorrent
+
+#Remember to NOT define ports in .rtorrent.rc for this to work.
+PORTFILE="/tmp/pia_forwarded_port.txt"
+PORT=$(awk 'NR==1' $PORTFILE 2>/dev/null)
+
+OPTIONS="-p $PORT'-'$PORT"
+CUSTOMCMDS="service openvpn forward"
+
+start() {
+    # Check if port in portfile is valid
+    if [ $PORT -ge 1 -a $PORT -le 65535 ] ; then
+        2> /dev/null
+    else
+        echo "Invalid port, check portfile"
+        exit 0
+    fi
+
+    # Check if rtorrent already is running. If so, quit
+    if [ "$(pidof rtorrent)" != "" ] ; then
+       echo "Rtorrent already running"
+       exit 0
+    fi
+
+    # openvpn specific command
+    $CUSTOMCMDS 2> /dev/null
+
+    # Start rtorrent in tmux window with specified user
+    su "$USER" -c "tmux new-session -d -s $SESS_NAME 'rtorrent $OPTIONS'"
+    if [ $? -ne 0 ] ; then
+        echo "RTorrent is running."
+    else
+        echo "RTorrent is started."
+    fi
+}
+
+stop() {
+    # Check if rtorrent is running. If not, sigkill
+    if [ "$(pidof rtorrent)" != "" ] ; then
+        kill -2 "$(pidof rtorrent)"
+
+        echo "Stopping rtorrent..."
+
+        while [ "$(pidof rtorrent)" != "" ] ; do
+            sleep 0.2
+        done
+    else
+        echo "RTorrent is NOT running."
+    fi
+}
+
+bringfront() {
+    # Bring tmux session window to front
+    if [ -e $PIDFILE ] ; then
+        su $USER -c "tmux at -t $SESS_NAME"
+    fi
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        while [ "$(pidof rtorrent)" != "" ] ; do
+            sleep 0.2
+        done
+        start
+        ;;
+    bring-front)
+        bringfront
+        ;;
+    *)
+        N=/etc/init.d/$NAME
+        echo "Usage: $0 [start|stop|restart|bring-front]"
+        exit 1
+        ;;
+esac
+
+exit 0
