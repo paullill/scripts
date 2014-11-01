@@ -1,0 +1,14 @@
+# append to "~/.bashrc"
+
+alias ta='tmux attach'
+alias tas='TMUX= tmux attach-session -t '
+alias tns='TMUX= tmux new -s '
+alias ts='tmux list-sessions'
+alias tks='tmux kill-session -t '
+
+
+make or append to "~/.tmux.conf"
+
+set -g prefix C-b
+bind-key -n C-SPACE select-pane -t :.+
+bind-key -n C-d detach-client
