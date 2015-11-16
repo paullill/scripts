@@ -1,8 +1,6 @@
 #!/bin/bash
 
-AD=I                                                                            #I for insert, D for delete
-
-function restrict(){															#Restricts number of connections per IP
+function restrict(){
     PORT=$3
     PROTOCOL=$2
     ADDORDELETE=$1
@@ -11,12 +9,18 @@ function restrict(){															#Restricts number of connections per IP
          echo "Need 3 parameters. [insert or delete] [protocol] [port]. Ex: 'xx.sh I tcp 80'";
          exit 0;
     fi
-
+	
+	#Restrict connections to 10 per minute for each IP
     iptables -$ADDORDELETE INPUT -p $PROTOCOL --dport $PORT -i eth0 -m state --state NEW -m recent --set
     iptables -$ADDORDELETE INPUT -p $PROTOCOL --dport $PORT -i eth0 -m state --state NEW -m recent --update --seconds 60 --hitcount 10 -j DROP
-#    echo "Applied rule for $PROTOCOL $PORT"
 
 }
+
+###############################
+#######    CONFIG		#######
+###############################
+
+AD=I		# I = Insert iptable rules; D = Delete iptables rules.
 
 iptables -$AD INPUT -p tcp ! --syn -m state --state NEW -j DROP                 #Force SYN check
 iptables -$AD INPUT -f -j DROP                                                  #Force fragments check
@@ -38,7 +42,8 @@ restrict $AD tcp 10000                                                          
 restrict $AD udp 26901:26999                                                    #
 restrict $AD tcp 25565                                                          #Minecraft
 restrict $AD udp 25565                                                          #Minecraft
+echo "Finished adding/removing rules"
 
 iptables-save >/etc/iptables.up.rules
+echo "Rules saved to iptables-save"
 
-echo "Finished adding/removing rules"
