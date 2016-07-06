@@ -47,8 +47,11 @@ PIDFILE="/var/run/rtorrent.pid"
 SOCKET="/var/run/rtorrent/rpc.socket"
 
 #Remember to NOT define ports in .rtorrent.rc for this to work.
-PORTFILE="/tmp/pia_forwarded_port.txt"
-PORT=$(awk 'NR==1' $PORTFILE 2>/dev/null)
+USERNAME="p4555624"
+PASSWORD="123zombies!"
+PIA_ID="<INSERT PIA_ID>"
+LOCAL_IP=`ifconfig tun0 | grep -Po "(?<=addr.)[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*"`
+PORT=$(curl -d "user=$USERNAME&pass=$PASSWORD&client_id=$PIA_ID&local_ip=$LOCAL_IP" https://www.privateinternetaccess.com/vpninfo/port_forward_assignment | grep -Po "[0-9]*")
 
 
 
